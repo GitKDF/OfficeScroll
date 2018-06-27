@@ -3,6 +3,7 @@
 #include <oleacc.h>		//needed for AccessibleObjectFromWindow
 #pragma comment(lib, "oleacc.lib")		//include reference to .lib.  This only works in MSVS, have to add it to linker info for other compilers
 
+
 //from windowsx.h, don't see a need to include it otherwise
 #define GET_X_LPARAM(lp)                        ((int)(short)LOWORD(lp))
 #define GET_Y_LPARAM(lp)                        ((int)(short)HIWORD(lp))
@@ -18,6 +19,8 @@ int suppressAlt = 0;				//flag/counter to supress the current alt keypress (or 2
 BOOL ignoreNextAlt = FALSE;			//flag to ignore the next alt keypress because it's one that we sent as an injected keypress (no way to identify injected keys on a WH_KEYBOARD hook)
 BYTE kbdState[256];					//array to hold keyboard state to restore it after a ctrl+scroll event in excel
 int restoreKbdState = 0;			//flag/counter to indicate that the keyboard state should be restored
+unsigned int scrollLines = 0;		//holds system setting of how many lines to scroll
+DWORD scrollRouting = 0;			//holds system setting of whether to scroll focus window or window under cursor
 
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -242,7 +245,6 @@ LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wMsg, LPARAM lParam)
 
 		//get handle to window under mouse
 		HWND msgHwnd = ((LPMOUSEHOOKSTRUCTEX)lParam)->hwnd; 
-
 		//we only care if we're over the EXCEL7 or _WwG (word) window (otherwise we can trap events if we're over a richedit control on the ribbon, which then prevents changing ribbons by scrolling)
 		wchar_t className[50];
 		if (GetClassName(msgHwnd, className, 50))	//if getclassname does not return 0
@@ -269,6 +271,18 @@ LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wMsg, LPARAM lParam)
 		bool alt = HIWORD(GetKeyState(VK_MENU));
 		bool shift = HIWORD(GetKeyState(VK_SHIFT));
 
+		//if we're not doing a modified scroll, and we're not trying to route to the window under cursor, then pass the message on
+		//if we don't do this, scroll events on the ribbon will still scroll the main window if scroll routing is to the focus window,
+		//rather than changing ribbons.  This works in excel, but Word (365) halfway scrolls the window under cursor even if the
+		//system setting is off (strange hybrid because it scrolls the word pane under the cursor, but scrolling over a ribbon on
+		//a background window scrolls the active window pane).  I've opted to always scroll window under cursor for Word, ignoring
+		//the system setting.  The downside is that if the system is set to scroll focus window, we break scrolling the ribbon,
+		//as I assume that Word itself does a point test on the message to see where to do the scroll event)
+		//I'm calling this acceptable because 1) everybody should have scroll under window enabled :D and 2) it seems that very
+		//few people even know that you can scroll the ribbons, so I doubt many people would ever even notice it.
+		if (!alt && !shift && !scrollRouting)
+			if (0 != lstrcmpi(className, L"_WwG"))
+				goto CallNext;
 
 		//get scroll distance; positive value is scroll up; divided by wheel_delta which is 120, since that is one "Click"
 		//mousewheels with no click for finite control will not react if scrolled too slowly, since this will get truncated to 0 during integer division
@@ -394,7 +408,7 @@ LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wMsg, LPARAM lParam)
 			}
 			else								//no shift key means vertical
 			{
-				if (!alt) zDelta *= 3;							//if not a large scroll by alt, scroll by three rows/lines which is the normal scroll value
+				if (!alt) zDelta *= scrollLines;			//if not a large scroll by alt, scroll by scrollLines value
 				if (zDelta < 0)	vtD.lVal = abs(zDelta);			//scroll down
 				else vtU.lVal = zDelta;							//scroll up
 			}
@@ -500,6 +514,19 @@ STDAPI Connect(IDispatch *pApplication)
 		}
 		else { hr = ERROR_ALREADY_EXISTS; DBGTRACE("Keyboardhook - ERROR_ALREADY_EXISTS\n"); }
 	}
+
+	//get scroll routing setting, or default to 0 if there's an error
+	//scroll routing is:
+	//	0 to focus window
+	//	1 to hybrid, focus window for desktop apps, window under cursor for store apps (windows 8.x thing only?)
+	//	2 to window under cursor (windows 10+ only, I believe)
+	#define SPI_GETMOUSEWHEELROUTING    0x201C
+	if (!SystemParametersInfo(SPI_GETMOUSEWHEELROUTING, 0, &scrollRouting, 0))
+		scrollRouting = 0;
+
+	//get system setting of how many lines to scroll, default to 3 if there's an error
+	if (!SystemParametersInfo(SPI_GETWHEELSCROLLLINES, 0, &scrollLines, 0))
+		scrollLines = 3;
 
 	if (S_OK != hr)		//if there was an initialization error anywhere...
 		Disconnect();		//call disconnect to unset hooks
