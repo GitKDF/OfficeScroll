@@ -25,6 +25,8 @@ BOOL ignoreNextAlt = FALSE;			//flag to ignore the next alt keypress because it'
 BYTE kbdState[256];					//array to hold keyboard state to restore it after a ctrl+scroll event in excel
 int restoreKbdState = 0;			//flag/counter to indicate that the keyboard state should be restored
 
+BOOL scrollSheets = FALSE;
+
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -235,7 +237,6 @@ LRESULT CALLBACK KbdMsgProc(int nCode, WPARAM wParam, LPARAM lParam)
 LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wMsg, LPARAM lParam)
 {
 	if (g_bRecurse || (nCode<0)) return CallNextHookEx(g_mouseHook, nCode, wMsg, lParam);
-	//return CallNextHookEx(g_mouseHook, nCode, wMsg, lParam);
 
 	if (1 == restoreKbdState)				//if flag is set to restore the keyboard state on this message
 	{
@@ -265,7 +266,9 @@ LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wMsg, LPARAM lParam)
 		if (alt) suppressAlt = TRUE;
 
 		//uncomment the following line to disable Ctrl + Alt + Scroll to change sheets in excel
-		//if (ctrl) goto CallNext;
+		if (ctrl) 
+			if (!scrollSheets)
+				goto CallNext;
 
 		//get handle to window receiving scroll message
 		HWND msgHwnd = ((LPMOUSEHOOKSTRUCTEX)lParam)->hwnd; 
@@ -481,6 +484,13 @@ CallCancel:
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+EXTERN_C void STDAPICALLTYPE UpdateScrollSheets(BOOL newSetting)
+{
+	scrollSheets = newSetting;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 STDAPI Disconnect()
 {
 	//_ASSERTE(g_mouseHook);
@@ -518,7 +528,7 @@ STDAPI Disconnect()
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-STDAPI Connect(IDispatch *pApplication)
+STDAPI Connect(IDispatch *pApplication, BOOL scrollSheets = FALSE)
 {
 	if (pApplication==NULL) return E_INVALIDARG;
 	HRESULT hr=S_OK;
@@ -559,6 +569,8 @@ STDAPI Connect(IDispatch *pApplication)
 		}
 		else { hr = ERROR_ALREADY_EXISTS; DBGTRACE("Keyboardhook - ERROR_ALREADY_EXISTS\n"); }
 	}
+
+	UpdateScrollSheets(scrollSheets);
 
 	if (S_OK != hr)		//if there was an initialization error anywhere...
 		Disconnect();		//call disconnect to unset hooks
