@@ -8,6 +8,11 @@
 #define GET_X_LPARAM(lp)                        ((int)(short)LOWORD(lp))
 #define GET_Y_LPARAM(lp)                        ((int)(short)HIWORD(lp))
 
+
+//used to get scroll routing setting
+#define SPI_GETMOUSEWHEELROUTING    0x201C
+
+
 extern "C" IMAGE_DOS_HEADER __ImageBase;
 HHOOK g_mouseHook;
 HHOOK g_kbdHook;
@@ -19,8 +24,6 @@ int suppressAlt = 0;				//flag/counter to supress the current alt keypress (or 2
 BOOL ignoreNextAlt = FALSE;			//flag to ignore the next alt keypress because it's one that we sent as an injected keypress (no way to identify injected keys on a WH_KEYBOARD hook)
 BYTE kbdState[256];					//array to hold keyboard state to restore it after a ctrl+scroll event in excel
 int restoreKbdState = 0;			//flag/counter to indicate that the keyboard state should be restored
-unsigned int scrollLines = 0;		//holds system setting of how many lines to scroll
-DWORD scrollRouting = 0;			//holds system setting of whether to scroll focus window or window under cursor
 
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -214,6 +217,15 @@ LRESULT CALLBACK KbdMsgProc(int nCode, WPARAM wParam, LPARAM lParam)
 			return 1;								//unless ignoreNextAlt is set, we eat all events
 		}
 	}
+	else		//any other key
+	{
+		//if we press any other key while alt is down, we want to suppress the next alt up event
+		//if alt is not down, this will be reset on the next altdown event (a few lines above)
+		//if we don't do this, pressing e.g. Alt+F to open the file menu, then releasing alt
+		//will send an altUP event, and disable allowing additional keypresses to continue
+		//activating menus/commands by keyboard.
+		suppressAlt = TRUE;
+	}
 		
 	return CallNextHookEx(g_kbdHook, nCode, wParam, lParam);
 }
@@ -223,6 +235,7 @@ LRESULT CALLBACK KbdMsgProc(int nCode, WPARAM wParam, LPARAM lParam)
 LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wMsg, LPARAM lParam)
 {
 	if (g_bRecurse || (nCode<0)) return CallNextHookEx(g_mouseHook, nCode, wMsg, lParam);
+	//return CallNextHookEx(g_mouseHook, nCode, wMsg, lParam);
 
 	if (1 == restoreKbdState)				//if flag is set to restore the keyboard state on this message
 	{
@@ -230,7 +243,7 @@ LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wMsg, LPARAM lParam)
 		restoreKbdState = 0;					//clear flag
 	}
 	else if (1 < restoreKbdState) {			//if count is greater than 1 because we want to process multiple sheet changes
-		restoreKbdState--;						//decrement the counter but leave keyboard state for the current message
+		restoreKbdState--;						//decrement the counter and leave keyboard state for the current message
 	}
 	
 	//if ((wMsg == WM_MOUSEWHEEL) && (HIWORD(GetKeyState(VK_SHIFT)) || HIWORD(GetKeyState(VK_MENU)))) //VK_MENU=ALT key
@@ -243,58 +256,75 @@ LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wMsg, LPARAM lParam)
 		//DBGTRACE("hwnd=0x%x\n",((LPMOUSEHOOKSTRUCT)lParam)->hwnd);
 		//DBGTRACE("WM_MOUSEWHEEL+VK_SHIFT|VK_MENU\n");
 
-		//get handle to window under mouse
-		HWND msgHwnd = ((LPMOUSEHOOKSTRUCTEX)lParam)->hwnd; 
-		//we only care if we're over the EXCEL7 or _WwG (word) window (otherwise we can trap events if we're over a richedit control on the ribbon, which then prevents changing ribbons by scrolling)
-		wchar_t className[50];
-		if (GetClassName(msgHwnd, className, 50))	//if getclassname does not return 0
-		{
-			//if we are not over the excel pane (EXCEL7), the excel edit in cell box (EXCEL6), or the Word pane (_WwG), ignore the message
-			if ((0 != lstrcmpi(className, L"EXCEL7")) && (0 != lstrcmpi(className, L"EXCEL6")) && (0 != lstrcmpi(className, L"_WwG")))
-				goto CallNext;
-
-			//if we're over the excel edit in place box
-			if (0 == lstrcmpi(className, L"EXCEL6"))
-			{
-				msgHwnd = GetParent(msgHwnd);								//get it's parent window ("XLDESK")
-				msgHwnd = FindWindowEx(msgHwnd, NULL, L"EXCEL7", NULL);		//get it's child with class "EXCEL7", which is the excel pane
-			}
-		}
-		else
-		{
-			//if we couldn't get the class name for some reason, pass the message on
-			goto CallNext;
-		}
-
 		//get key states
 		bool ctrl = HIWORD(GetKeyState(VK_CONTROL));
 		bool alt = HIWORD(GetKeyState(VK_MENU));
 		bool shift = HIWORD(GetKeyState(VK_SHIFT));
 
-		//if we're not doing a modified scroll, and we're not trying to route to the window under cursor, then pass the message on
-		//if we don't do this, scroll events on the ribbon will still scroll the main window if scroll routing is to the focus window,
-		//rather than changing ribbons.  This works in excel, but Word (365) halfway scrolls the window under cursor even if the
-		//system setting is off (strange hybrid because it scrolls the word pane under the cursor, but scrolling over a ribbon on
-		//a background window scrolls the active window pane).  I've opted to always scroll window under cursor for Word, ignoring
-		//the system setting.  The downside is that if the system is set to scroll focus window, we break scrolling the ribbon,
-		//as I assume that Word itself does a point test on the message to see where to do the scroll event)
-		//I'm calling this acceptable because 1) everybody should have scroll under window enabled :D and 2) it seems that very
-		//few people even know that you can scroll the ribbons, so I doubt many people would ever even notice it.
-		if (!alt && !shift && !scrollRouting)
-			if (0 != lstrcmpi(className, L"_WwG"))
-				goto CallNext;
+		//set flag to suppress the current alt keypress if alt is down, even if we don't handle the event (e.g. cursor is over the ribbon)
+		if (alt) suppressAlt = TRUE;
+
+		//uncomment the following line to disable Ctrl + Alt + Scroll to change sheets in excel
+		//if (ctrl) goto CallNext;
+
+		//get handle to window receiving scroll message
+		HWND msgHwnd = ((LPMOUSEHOOKSTRUCTEX)lParam)->hwnd; 
+
+		//get system setting of whether to scroll focus window or window under cursor, or default to 0 if there's an error which implies pre windows 8
+		//scroll routing is:
+		//	MOUSEWHEEL_ROUTING_FOCUS     = 0 to focus window
+		//	MOUSEWHEEL_ROUTING_HYBRID    = 1 to hybrid, focus window for desktop apps, window under cursor for store apps (windows 8.0 only)
+		//	MOUSEWHEEL_ROUTING_MOUSE_POS = 2 to window under cursor (windows 8.1+)
+		DWORD scrollRouting;
+		if (!SystemParametersInfo(SPI_GETMOUSEWHEELROUTING, 0, &scrollRouting, 0))
+			scrollRouting = 0;
+
+		HWND checkwin;				//used to check what window we're over
+		if (2 != scrollRouting)		//if scroll routing is not to the window under the cursor...
+			checkwin = WindowFromPoint(((LPMOUSEHOOKSTRUCTEX)lParam)->pt);	//...get the window under the cursor
+		else						//otherwise the window receiving the message is the same as the one under the cursor
+			checkwin = msgHwnd;
+
+		//check to make sure that we're over a control where we handle scroll events
+		//we only care if we're over the main EXCEL7 or _WwG (word) panes (otherwise we can trap events if we're over the ribbon, which then prevents changing ribbons by scrolling)
+		wchar_t className[50];
+		if (!GetClassName(checkwin, className, 50))	//if we couldn't get the class name for some reason...
+			goto CallNext;								//pass the message on
+
+		//if we're not over the excel pane (EXCEL7), the excel edit-in-cell box (EXCEL6), or the Word pane (_WwG)
+		if ((0 != lstrcmpi(className, L"EXCEL7")) && (0 != lstrcmpi(className, L"EXCEL6")) && (0 != lstrcmpi(className, L"_WwG")))
+			if (GetAncestor(msgHwnd, GA_ROOT) == GetAncestor(checkwin, GA_ROOT))		//and we ARE over our own parent window
+				goto CallNext;															//ignore the message
+				//we don't care if we're not over the Excel/Word pane as long as we're over another window completely as can be the case with
+				//scroll to focus window, but if we're not over the Excel/Word pane and we are over our window, then we're over the ribbon
+
+
+		//if scroll is not to the window under the cursor, get the classname of the window receiving the message
+		//we only need to do this if scroll routing is focus or hybrid, since otherwise they're the same window, set a few lines above (checkwin = msgHwnd)
+		if (2 != scrollRouting)
+			if (!GetClassName(msgHwnd, className, 50))	//if we couldn't get the class name for some reason...
+				goto CallNext;								//pass the message on
+
+		//if the window receiving the message is the excel edit-in-place box
+		if (0 == lstrcmpi(className, L"EXCEL6")) {
+			msgHwnd = GetParent(msgHwnd);								//get it's parent window ("XLDESK")
+			msgHwnd = FindWindowEx(msgHwnd, NULL, L"EXCEL7", NULL);		//get it's child with class "EXCEL7", which is the excel pane
+		}
+
 
 		//get scroll distance; positive value is scroll up; divided by wheel_delta which is 120, since that is one "Click"
 		//mousewheels with no click for finite control will not react if scrolled too slowly, since this will get truncated to 0 during integer division
 		short zDelta = GET_WHEEL_DELTA_WPARAM(((LPMOUSEHOOKSTRUCTEX)lParam)->mouseData) / WHEEL_DELTA;
 
+
+
 		//the following handles ctrl+alt+scroll events in excel to change sheets
 		if (ctrl) {										//if ctrl is down
-			if (0 == lstrcmpi(className, L"_WwG"))			//if we're over a word window
-				goto CallNext;									//pass the message on since we don't handle any ctrl+scroll events in word
-
 			if (!alt || shift)								//if alt is not down, or shift is also down
-				goto CallNext;									//pass the message on since we only want ctrl+alt+scroll events in excel, no other modifiers
+				goto CallNext;									//pass the message on since we only want ctrl+alt+scroll events, no other modifiers
+
+			if (0 == lstrcmpi(className, L"_WwG"))			//if we're over a word window
+				goto CallNext;									//pass the message on since we don't handle this event in word
 
 			//get current focus handle
 			HWND FocusHandle = GetFocus();
@@ -386,12 +416,22 @@ LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wMsg, LPARAM lParam)
 
 
 		//use an actual IDispatch rather than a variant to get window under cursor (rather than active window as previous version)
+		//we don't need to worry about getting the active window if the system is set to scroll the focus window, as it will be the
+		//active window that receives the scroll message anyway, not the window under cursor
 		IDispatch* IDAppWin = NULL;
 		
 		if SUCCEEDED(AccessibleObjectFromWindow(msgHwnd, OBJID_NATIVEOM, IID_IDispatch, (void **)&IDAppWin))  //get IDispatch to window under cursor
 		{
-			if (alt) suppressAlt = TRUE;										//set flag to suppress the current alt keypress
-			LPOLESTR pstrMethodName = alt ? L"LargeScroll" : L"SmallScroll";	//scroll by line/cell or by page depending on alt key
+			//get system setting of how many lines to scroll, default to 3 if there's an error
+			unsigned int scrollLines;
+			if (!SystemParametersInfo(SPI_GETWHEELSCROLLLINES, 0, &scrollLines, 0))
+				scrollLines = 3;
+
+			//if system scroll setting is by page, swap alt flag to swap alt functionality, i.e. holding alt is small scroll, large scroll without
+			if (-1 == scrollLines) alt = !alt;
+
+			//scroll by line/cell or by page depending on alt key
+			LPOLESTR pstrMethodName = alt ? L"LargeScroll" : L"SmallScroll";
 			
 			VARIANT vtL, vtR, vtU, vtD;
 			//set all direction variants to VB Long type
@@ -403,24 +443,29 @@ LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wMsg, LPARAM lParam)
 
 			if (shift)	//if shift key means horizontal
 			{
-				if (zDelta < 0)	vtR.lVal = abs(zDelta);			//scroll down = right
-				else vtL.lVal = zDelta;							//scroll up = left
+				if (zDelta < 0)	vtR.lVal = abs(zDelta);				//scroll down = right
+				else vtL.lVal = zDelta;								//scroll up = left
 			}
 			else								//no shift key means vertical
 			{
-				if (!alt) zDelta *= scrollLines;			//if not a large scroll by alt, scroll by scrollLines value
-				if (zDelta < 0)	vtD.lVal = abs(zDelta);			//scroll down
-				else vtU.lVal = zDelta;							//scroll up
+				if (!alt)											//if not a large scroll
+					zDelta *= (-1 == scrollLines) ? 3: scrollLines;		//multiply zDelta by scrollLines, or if scroll by page then default to 3 (the windows default scroll speed)
+				if (zDelta < 0)	vtD.lVal = abs(zDelta);				//scroll down
+				else vtU.lVal = zDelta;								//scroll up
 			}
 
 			//send scroll command
-			AutoWrap(DISPATCH_METHOD, NULL, IDAppWin, pstrMethodName, 4, vtL, vtR, vtU, vtD); //Left, Right, Up, Down (reverse order!)
+			HRESULT scrollResult = AutoWrap(DISPATCH_METHOD, NULL, IDAppWin, pstrMethodName, 4, vtL, vtR, vtU, vtD); //Left, Right, Up, Down (reverse order!)
 
 			//memory cleanup
 			VariantClear(&vtL); VariantClear(&vtR); VariantClear(&vtU); VariantClear(&vtD);
 			IDAppWin->Release();
 
-			goto CallCancel;
+			if SUCCEEDED(scrollResult)
+				goto CallCancel;		//handle the event if the scroll succeeded
+			else
+				goto CallNext;			//let the application handle it if it didn't
+
 		} //if we didn't succeed in getting the window, we'll fall through and the next hook will be called letting the system handle the message
 	}
 
@@ -514,19 +559,6 @@ STDAPI Connect(IDispatch *pApplication)
 		}
 		else { hr = ERROR_ALREADY_EXISTS; DBGTRACE("Keyboardhook - ERROR_ALREADY_EXISTS\n"); }
 	}
-
-	//get scroll routing setting, or default to 0 if there's an error
-	//scroll routing is:
-	//	0 to focus window
-	//	1 to hybrid, focus window for desktop apps, window under cursor for store apps (windows 8.x thing only?)
-	//	2 to window under cursor (windows 10+ only, I believe)
-	#define SPI_GETMOUSEWHEELROUTING    0x201C
-	if (!SystemParametersInfo(SPI_GETMOUSEWHEELROUTING, 0, &scrollRouting, 0))
-		scrollRouting = 0;
-
-	//get system setting of how many lines to scroll, default to 3 if there's an error
-	if (!SystemParametersInfo(SPI_GETWHEELSCROLLLINES, 0, &scrollLines, 0))
-		scrollLines = 3;
 
 	if (S_OK != hr)		//if there was an initialization error anywhere...
 		Disconnect();		//call disconnect to unset hooks
