@@ -2,6 +2,7 @@
 #include "debugtrace.h"
 #include <oleacc.h>		//needed for AccessibleObjectFromWindow
 #pragma comment(lib, "oleacc.lib")		//include reference to .lib.  This only works in MSVS, have to add it to linker info for other compilers
+#include <thread>		//used to instantiate a non-blocking messagebox
 
 
 //from windowsx.h, don't see a need to include it otherwise
@@ -24,8 +25,8 @@ int suppressAlt = 0;				//flag/counter to supress the current alt keypress (or 2
 BOOL ignoreNextAlt = FALSE;			//flag to ignore the next alt keypress because it's one that we sent as an injected keypress (no way to identify injected keys on a WH_KEYBOARD hook)
 BYTE kbdState[256];					//array to hold keyboard state to restore it after a ctrl+scroll event in excel
 int restoreKbdState = 0;			//flag/counter to indicate that the keyboard state should be restored
-
-BOOL scrollSheets = FALSE;
+BOOL scrollSheets = FALSE;			//flag to indicate if scrolling sheets in excel is enabled
+int sequentialAltCounter = 0;		//counter for sequential alt press and releases, used for toggling scroll sheets setting
 
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -172,7 +173,28 @@ LRESULT CALLBACK KbdMsgProc(int nCode, WPARAM wParam, LPARAM lParam)
 				return 1;							//eat the keypress
 			}
 			
-			//if we get here, we're on a keyup, no cancel event, so we want to send excel a single alt press (down then up)
+			sequentialAltCounter++;					//increment our counter that there was a non-supressed alt keypress
+
+			//check to see if there are any keys besides alt held down, in which case we don't actually want to send a new one,
+			//since the user didn't press and release alt on it's own with no other keys down to activate the keyboard shortcut hints
+			BYTE currentKbdState[256];
+			GetKeyboardState(currentKbdState);
+			BOOL otherKeys = FALSE;
+			for (int i = 0; i < 256; i++) {								//loop through all keys
+				if (currentKbdState[i] & 0x80) {							//if a key is down (top bit set)
+					if ((VK_MENU == i) || (VK_LMENU == i) || (VK_RMENU == i))	//if it's an Alt key
+						continue;													//ignore it
+					otherKeys = TRUE;											//otherwise set key down flag
+					break;														//leave loop
+				}
+			}
+			
+			if (otherKeys) {								//if any other keys are also down
+				DBGTRACE("Suppressed - Other key down\n");
+				return 1;										//eat the keypress since we only want to send an alt keypress if it was pushed and released with no other keys down
+			}
+
+			//if we get here, we're on a keyup, no other keys pressed, no cancel event, so we want to send excel a single alt press (down then up)
 			ignoreNextAlt = TRUE;			//set flag to indicate that we're sending a keypress and that we should ignore subsequent alt keypresses until there's an alt up event with nCode HC_ACTION
 
 			INPUT ip[2] = { 0 };											//2 for down then up events
@@ -188,7 +210,7 @@ LRESULT CALLBACK KbdMsgProc(int nCode, WPARAM wParam, LPARAM lParam)
 			ip[1].ki.dwFlags = KEYEVENTF_EXTENDEDKEY | KEYEVENTF_SCANCODE | KEYEVENTF_KEYUP;		//same but with key up
 
 			SendInput(2, ip, sizeof(INPUT));								//send keypresses
-						
+			
 			DBGTRACE("Sent New Alt Keypress\n");
 			return 1;														//eat the current keypress event
 		}
@@ -227,9 +249,56 @@ LRESULT CALLBACK KbdMsgProc(int nCode, WPARAM wParam, LPARAM lParam)
 		//will send an altUP event, and disable allowing additional keypresses to continue
 		//activating menus/commands by keyboard.
 		suppressAlt = TRUE;
+		sequentialAltCounter = 0;		//also reset our counter for sequential Alt key presses
 	}
 		
 	return CallNextHookEx(g_kbdHook, nCode, wParam, lParam);
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+BOOL toggleScrollSheets()
+{
+	//initialize variante variables
+	VARIANT vtMsoScrollWB;
+	VariantInit(&vtMsoScrollWB);
+	VARIANT vtSheet;
+	VariantInit(&vtSheet);
+	VARIANT vtScrollSheetsRange;
+	VariantInit(&vtScrollSheetsRange);
+
+	//this variable will hold the string "MsoScroll.xla", which for convenience is the filename, sheet name, and named range name, so we can use it multiple times
+	VARIANT vtMsoScrollDOTxlaBString;
+	vtMsoScrollDOTxlaBString.vt = VT_BSTR;
+	vtMsoScrollDOTxlaBString.bstrVal = SysAllocString(L"MsoScroll.xla");
+
+	//initialize flag to indicate match
+	bool retVal = FALSE;
+
+	if SUCCEEDED(AutoWrap(DISPATCH_PROPERTYGET, &vtMsoScrollWB, g_pApplication, L"Workbooks", 1, vtMsoScrollDOTxlaBString)) {				//get MsoScroll.xla workbook
+		if SUCCEEDED(AutoWrap(DISPATCH_PROPERTYGET, &vtSheet, vtMsoScrollWB.pdispVal, L"Sheets", 1, vtMsoScrollDOTxlaBString)) {				//get sheet named MsoScroll.xla (the only sheet)
+			if SUCCEEDED(AutoWrap(DISPATCH_PROPERTYGET, &vtScrollSheetsRange, vtSheet.pdispVal, L"Range", 1, vtMsoScrollDOTxlaBString)) {				//get range named MsoScroll.xla
+				VARIANT vtIntValue;					//create new integer variant and set it's value opposite of current scroll setting
+				vtIntValue.vt = VT_INT;
+				vtIntValue.intVal = !scrollSheets;			//set to the opposite of current setting value, since we're trying to switch it
+				if SUCCEEDED(AutoWrap(DISPATCH_PROPERTYPUT, NULL, vtScrollSheetsRange.pdispVal, L"Value", 1, vtIntValue)) {									//set cell value
+					if SUCCEEDED(AutoWrap(DISPATCH_METHOD, NULL, vtMsoScrollWB.pdispVal, L"Save", 0)) {															//save the workbook
+						//if all of these have succeeded, including successfully saving the workbook to preserve the setting for next time
+						retVal = TRUE;					//set flag that we succeeded
+						scrollSheets = !scrollSheets;	//set our internal flag to new setting
+					}
+				}
+				VariantClear(&vtIntValue);					//clear vars used since we succeeded in getting them
+				VariantClear(&vtScrollSheetsRange);
+			}
+			VariantClear(&vtSheet);						//clear vars used since we succeeded in getting them
+		}
+		VariantClear(&vtMsoScrollWB);				//clear vars used since we succeeded in getting them
+	}
+
+	VariantClear(&vtMsoScrollDOTxlaBString);	//clear var
+
+	return retVal;
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -262,16 +331,40 @@ LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wMsg, LPARAM lParam)
 		bool alt = HIWORD(GetKeyState(VK_MENU));
 		bool shift = HIWORD(GetKeyState(VK_SHIFT));
 
-		//set flag to suppress the current alt keypress if alt is down, even if we don't handle the event (e.g. cursor is over the ribbon)
-		if (alt) suppressAlt = TRUE;
-
-		//uncomment the following line to disable Ctrl + Alt + Scroll to change sheets in excel
-		if (ctrl) 
-			if (!scrollSheets)
-				goto CallNext;
-
 		//get handle to window receiving scroll message
 		HWND msgHwnd = ((LPMOUSEHOOKSTRUCTEX)lParam)->hwnd; 
+
+		//set flag to suppress the current alt keypress if alt is down, even if we don't handle the event (e.g. cursor is over the ribbon)
+		if (alt) {
+			suppressAlt = TRUE;
+			//if the user is holding Ctrl, has pressed Alt 5 or more times, holding on the last time, and scrolls, toggle the ctrl+alt+scroll setting
+			if (4 <= sequentialAltCounter && ctrl && !shift) {
+				HWND appHwnd = GetAncestor(msgHwnd, GA_ROOTOWNER);	//get main window
+				wchar_t className[50];							//buffer to get class name
+				if (GetClassName(appHwnd, className, 50)) {		//make sure we get the class name successfully
+					if (0 == lstrcmpi(className, L"XLMAIN")) {		//make sure that it's an excel window
+						sequentialAltCounter = 0;						//reset counter for sequential alt presses
+						BOOL toggleStatus = toggleScrollSheets();		//call function to toggle setting and store result
+						wchar_t* msg = toggleStatus						//set messagebox text based on result
+											? scrollSheets					//if successfull, set based on new setting value
+												? L"Ctrl+Alt+Scroll to change sheets is Enabled.\n\nHold Ctrl, press Alt 4 times, then press and hold it a 5th time\nand scroll either direction to toggle setting."
+												: L"Ctrl+Alt+Scroll to change sheets is Disabled.\n\nHold Ctrl, press Alt 4 times, then press and hold it a 5th time\nand scroll either direction to toggle setting."
+											: L"Error changing setting for Ctrl+Alt+Scroll to change sheets.";
+
+						//show the msgbox in a new thread so we don't block this one, which will timeout the hook and pass the message on to the application
+						std::thread t(MessageBox, appHwnd, msg, L"MsoScroll", MB_SETFOREGROUND | MB_TOPMOST | (toggleStatus ? 0 : MB_ICONERROR));
+						t.detach();
+
+						goto CallCancel;	//we handled the message
+					}
+				}
+			}
+		}
+
+		//if ctrl is down, check to see whether we're handling 
+		if (ctrl)
+			if (!scrollSheets)
+				goto CallNext;
 
 		//get system setting of whether to scroll focus window or window under cursor, or default to 0 if there's an error which implies pre windows 8
 		//scroll routing is:
@@ -484,7 +577,7 @@ CallCancel:
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-EXTERN_C void STDAPICALLTYPE UpdateScrollSheets(BOOL newSetting)
+EXTERN_C void STDAPICALLTYPE SetScrollSheets(BOOL newSetting)
 {
 	scrollSheets = newSetting;
 }
@@ -500,8 +593,8 @@ STDAPI Disconnect()
 		g_mouseHook = NULL;
 		DBGTRACE("MsoScroll::UnhookWindowsHookEx - Mouse\n");
 	}
-	//keyboard hook added to supress an alt keypress when page scrolling
-	//before, doing so would show the keyboard shortcut hints, and pressing a key would activate them
+	//keyboard hook added to supress an alt keypress when page scrolling.  Without this,
+	//doing so would show the keyboard shortcut hints, and pressing a key would activate them
 	//if we scroll while holding alt, we suppress the event.  if we release alt without scrolling, we
 	//send an alt keypress event.  This means that to see the keyboard shortcut hints, the user must
 	//press and release alt, whereas the default behaviour is to show them after a second or so of
@@ -528,13 +621,13 @@ STDAPI Disconnect()
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-STDAPI Connect(IDispatch *pApplication, BOOL scrollSheets = FALSE)
+STDAPI Connect(IDispatch *pApplication)
 {
-	if (pApplication==NULL) return E_INVALIDARG;
-	HRESULT hr=S_OK;
+	if (pApplication == NULL) return E_INVALIDARG;
+	HRESULT hr = S_OK;
 
-	_ASSERTE(g_pApplication==NULL);
-	if (g_pApplication==NULL)
+	_ASSERTE(g_pApplication == NULL);
+	if (g_pApplication == NULL)
 	{
 		//get application name
 //		VARIANT vtAppName;
@@ -549,28 +642,26 @@ STDAPI Connect(IDispatch *pApplication, BOOL scrollSheets = FALSE)
 		DBGTRACE("MsoScroll::Connect\n");
 		//}
 	}
-	else hr=ERROR_ALREADY_ASSIGNED;
+	else hr = ERROR_ALREADY_ASSIGNED;
 
 	if SUCCEEDED(hr)
 	{
-		_ASSERTE(g_mouseHook==NULL);
-		if (g_mouseHook==NULL)
+		_ASSERTE(g_mouseHook == NULL);
+		if (g_mouseHook == NULL)
 		{
-			g_mouseHook=SetWindowsHookEx(WH_MOUSE, MouseHookProc, (HINSTANCE)&__ImageBase, GetCurrentThreadId());
+			g_mouseHook = SetWindowsHookEx(WH_MOUSE, MouseHookProc, (HINSTANCE)&__ImageBase, GetCurrentThreadId());
 			DBGTRACE("MsoScroll::SetWindowsHookEx - Mouse\n");
 		}
-		else {hr=ERROR_ALREADY_EXISTS; DBGTRACE("Mousehook - ERROR_ALREADY_EXISTS\n");}
+		else { hr = ERROR_ALREADY_EXISTS; DBGTRACE("Mousehook - ERROR_ALREADY_EXISTS\n"); }
 
 		_ASSERTE(g_kbdHook == NULL);
-		if (g_kbdHook == NULL)
+		if (SUCCEEDED(hr) && g_kbdHook == NULL)
 		{
 			g_kbdHook = SetWindowsHookEx(WH_KEYBOARD, KbdMsgProc, (HINSTANCE)&__ImageBase, GetCurrentThreadId());
 			DBGTRACE("MsoScroll::SetWindowsHookEx - Keyboard\n");
 		}
 		else { hr = ERROR_ALREADY_EXISTS; DBGTRACE("Keyboardhook - ERROR_ALREADY_EXISTS\n"); }
 	}
-
-	UpdateScrollSheets(scrollSheets);
 
 	if (S_OK != hr)		//if there was an initialization error anywhere...
 		Disconnect();		//call disconnect to unset hooks

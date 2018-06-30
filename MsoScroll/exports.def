@@ -1,4 +1,4 @@
 EXPORTS
 	Connect    PRIVATE
 	Disconnect PRIVATE
-	UpdateScrollSheets PRIVATE
+	SetScrollSheets PRIVATE
