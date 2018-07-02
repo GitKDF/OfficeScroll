@@ -12,6 +12,7 @@
 
 //used to get scroll routing setting
 #define SPI_GETMOUSEWHEELROUTING    0x201C
+#define SPI_GETWHEELSCROLLCHARS   0x006C
 
 
 extern "C" IMAGE_DOS_HEADER __ImageBase;
@@ -25,8 +26,9 @@ int suppressAlt = 0;				//flag/counter to supress the current alt keypress (or 2
 BOOL ignoreNextAlt = FALSE;			//flag to ignore the next alt keypress because it's one that we sent as an injected keypress (no way to identify injected keys on a WH_KEYBOARD hook)
 BYTE kbdState[256];					//array to hold keyboard state to restore it after a ctrl+scroll event in excel
 int restoreKbdState = 0;			//flag/counter to indicate that the keyboard state should be restored
-BOOL scrollSheets = FALSE;			//flag to indicate if scrolling sheets in excel is enabled
-int sequentialAltCounter = 0;		//counter for sequential alt press and releases, used for toggling scroll sheets setting
+bool scrollSheets = FALSE;			//flag to indicate if scrolling sheets in excel is enabled; default to 0 so we don't handle any ctrl+scroll events in word
+int verticalScrollValue = 0;		//vertical scroll setting; default to 0 to use system setting
+int horizontalScrollValue = 1;		//default to 1 so we do a single horiz scroll in Word, and this was previously the only setting for excel and is a reasonable default
 
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -173,8 +175,6 @@ LRESULT CALLBACK KbdMsgProc(int nCode, WPARAM wParam, LPARAM lParam)
 				return 1;							//eat the keypress
 			}
 			
-			sequentialAltCounter++;					//increment our counter that there was a non-supressed alt keypress
-
 			//check to see if there are any keys besides alt held down, in which case we don't actually want to send a new one,
 			//since the user didn't press and release alt on it's own with no other keys down to activate the keyboard shortcut hints
 			BYTE currentKbdState[256];
@@ -249,56 +249,9 @@ LRESULT CALLBACK KbdMsgProc(int nCode, WPARAM wParam, LPARAM lParam)
 		//will send an altUP event, and disable allowing additional keypresses to continue
 		//activating menus/commands by keyboard.
 		suppressAlt = TRUE;
-		sequentialAltCounter = 0;		//also reset our counter for sequential Alt key presses
 	}
 		
 	return CallNextHookEx(g_kbdHook, nCode, wParam, lParam);
-}
-
-////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-BOOL toggleScrollSheets()
-{
-	//initialize variante variables
-	VARIANT vtMsoScrollWB;
-	VariantInit(&vtMsoScrollWB);
-	VARIANT vtSheet;
-	VariantInit(&vtSheet);
-	VARIANT vtScrollSheetsRange;
-	VariantInit(&vtScrollSheetsRange);
-
-	//this variable will hold the string "MsoScroll.xla", which for convenience is the filename, sheet name, and named range name, so we can use it multiple times
-	VARIANT vtMsoScrollDOTxlaBString;
-	vtMsoScrollDOTxlaBString.vt = VT_BSTR;
-	vtMsoScrollDOTxlaBString.bstrVal = SysAllocString(L"MsoScroll.xla");
-
-	//initialize flag to indicate match
-	bool retVal = FALSE;
-
-	if SUCCEEDED(AutoWrap(DISPATCH_PROPERTYGET, &vtMsoScrollWB, g_pApplication, L"Workbooks", 1, vtMsoScrollDOTxlaBString)) {				//get MsoScroll.xla workbook
-		if SUCCEEDED(AutoWrap(DISPATCH_PROPERTYGET, &vtSheet, vtMsoScrollWB.pdispVal, L"Sheets", 1, vtMsoScrollDOTxlaBString)) {				//get sheet named MsoScroll.xla (the only sheet)
-			if SUCCEEDED(AutoWrap(DISPATCH_PROPERTYGET, &vtScrollSheetsRange, vtSheet.pdispVal, L"Range", 1, vtMsoScrollDOTxlaBString)) {				//get range named MsoScroll.xla
-				VARIANT vtIntValue;					//create new integer variant and set it's value opposite of current scroll setting
-				vtIntValue.vt = VT_INT;
-				vtIntValue.intVal = !scrollSheets;			//set to the opposite of current setting value, since we're trying to switch it
-				if SUCCEEDED(AutoWrap(DISPATCH_PROPERTYPUT, NULL, vtScrollSheetsRange.pdispVal, L"Value", 1, vtIntValue)) {									//set cell value
-					if SUCCEEDED(AutoWrap(DISPATCH_METHOD, NULL, vtMsoScrollWB.pdispVal, L"Save", 0)) {															//save the workbook
-						//if all of these have succeeded, including successfully saving the workbook to preserve the setting for next time
-						retVal = TRUE;					//set flag that we succeeded
-						scrollSheets = !scrollSheets;	//set our internal flag to new setting
-					}
-				}
-				VariantClear(&vtIntValue);					//clear vars used since we succeeded in getting them
-				VariantClear(&vtScrollSheetsRange);
-			}
-			VariantClear(&vtSheet);						//clear vars used since we succeeded in getting them
-		}
-		VariantClear(&vtMsoScrollWB);				//clear vars used since we succeeded in getting them
-	}
-
-	VariantClear(&vtMsoScrollDOTxlaBString);	//clear var
-
-	return retVal;
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -335,31 +288,7 @@ LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wMsg, LPARAM lParam)
 		HWND msgHwnd = ((LPMOUSEHOOKSTRUCTEX)lParam)->hwnd; 
 
 		//set flag to suppress the current alt keypress if alt is down, even if we don't handle the event (e.g. cursor is over the ribbon)
-		if (alt) {
-			suppressAlt = TRUE;
-			//if the user is holding Ctrl, has pressed Alt 5 or more times, holding on the last time, and scrolls, toggle the ctrl+alt+scroll setting
-			if (4 <= sequentialAltCounter && ctrl && !shift) {
-				HWND appHwnd = GetAncestor(msgHwnd, GA_ROOTOWNER);	//get main window
-				wchar_t className[50];							//buffer to get class name
-				if (GetClassName(appHwnd, className, 50)) {		//make sure we get the class name successfully
-					if (0 == lstrcmpi(className, L"XLMAIN")) {		//make sure that it's an excel window
-						sequentialAltCounter = 0;						//reset counter for sequential alt presses
-						BOOL toggleStatus = toggleScrollSheets();		//call function to toggle setting and store result
-						wchar_t* msg = toggleStatus						//set messagebox text based on result
-											? scrollSheets					//if successfull, set based on new setting value
-												? L"Ctrl+Alt+Scroll to change sheets is Enabled.\n\nHold Ctrl, press Alt 4 times, then press and hold it a 5th time\nand scroll either direction to toggle setting."
-												: L"Ctrl+Alt+Scroll to change sheets is Disabled.\n\nHold Ctrl, press Alt 4 times, then press and hold it a 5th time\nand scroll either direction to toggle setting."
-											: L"Error changing setting for Ctrl+Alt+Scroll to change sheets.";
-
-						//show the msgbox in a new thread so we don't block this one, which will timeout the hook and pass the message on to the application
-						std::thread t(MessageBox, appHwnd, msg, L"MsoScroll", MB_SETFOREGROUND | MB_TOPMOST | (toggleStatus ? 0 : MB_ICONERROR));
-						t.detach();
-
-						goto CallCancel;	//we handled the message
-					}
-				}
-			}
-		}
+		if (alt) suppressAlt = TRUE;
 
 		//if ctrl is down, check to see whether we're handling 
 		if (ctrl)
@@ -419,8 +348,9 @@ LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wMsg, LPARAM lParam)
 			if (!alt || shift)								//if alt is not down, or shift is also down
 				goto CallNext;									//pass the message on since we only want ctrl+alt+scroll events, no other modifiers
 
-			if (0 == lstrcmpi(className, L"_WwG"))			//if we're over a word window
-				goto CallNext;									//pass the message on since we don't handle this event in word
+			//removed since this will never be true in word, so we'll never get here if ctrl is down
+			//if (0 == lstrcmpi(className, L"_WwG"))			//if we're over a word window
+			//	goto CallNext;									//pass the message on since we don't handle this event in word
 
 			//get current focus handle
 			HWND FocusHandle = GetFocus();
@@ -518,17 +448,6 @@ LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wMsg, LPARAM lParam)
 		
 		if SUCCEEDED(AccessibleObjectFromWindow(msgHwnd, OBJID_NATIVEOM, IID_IDispatch, (void **)&IDAppWin))  //get IDispatch to window under cursor
 		{
-			//get system setting of how many lines to scroll, default to 3 if there's an error
-			unsigned int scrollLines;
-			if (!SystemParametersInfo(SPI_GETWHEELSCROLLLINES, 0, &scrollLines, 0))
-				scrollLines = 3;
-
-			//if system scroll setting is by page, swap alt flag to swap alt functionality, i.e. holding alt is small scroll, large scroll without
-			if (-1 == scrollLines) alt = !alt;
-
-			//scroll by line/cell or by page depending on alt key
-			LPOLESTR pstrMethodName = alt ? L"LargeScroll" : L"SmallScroll";
-			
 			VARIANT vtL, vtR, vtU, vtD;
 			//set all direction variants to VB Long type
 			vtL.vt = VT_I4;	vtR.vt = VT_I4;	vtU.vt = VT_I4;	vtD.vt = VT_I4;	//VB Long type
@@ -539,17 +458,46 @@ LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wMsg, LPARAM lParam)
 
 			if (shift)	//if shift key means horizontal
 			{
+				if (0 == horizontalScrollValue)			//if horizontal scroll value is set to 0 to use system setting
+				{
+					//get system setting of how many characters/columns to scroll, default to 3 if there's an error
+					unsigned int systemScrollColumns;
+					if (!SystemParametersInfo(SPI_GETWHEELSCROLLCHARS, 0, &systemScrollColumns, 0))
+						systemScrollColumns = 1;				//default to 1 if we couldn't get the system setting
+					zDelta *= systemScrollColumns;			//multiply zDelta by systemScrollColumns to scroll in increments of systemScrollColumns
+				}
+				else
+				{										//otherwise there is a custom value
+					zDelta *= horizontalScrollValue;		//multiply zDelta by horizontalScrollValue to scroll in increments of horizontalScrollValue
+				}
+
 				if (zDelta < 0)	vtR.lVal = abs(zDelta);				//scroll down = right
 				else vtL.lVal = zDelta;								//scroll up = left
 			}
 			else								//no shift key means vertical
 			{
+				//get system setting of how many lines to scroll, default to 3 if there's an error getting the value
+				unsigned int systemScrollLines;
+				if (!SystemParametersInfo(SPI_GETWHEELSCROLLLINES, 0, &systemScrollLines, 0))
+					systemScrollLines = 3;
+
+				//if system scroll setting is by page, swap alt flag to swap alt functionality, i.e. holding alt is small scroll, large scroll without
+				if (-1 == systemScrollLines) alt = !alt;
+
 				if (!alt)											//if not a large scroll
-					zDelta *= (-1 == scrollLines) ? 3: scrollLines;		//multiply zDelta by scrollLines, or if scroll by page then default to 3 (the windows default scroll speed)
+					//multiply zDelta to scroll by scroll lines setting
+					zDelta *= (0 != verticalScrollValue)				//if custom setting is not to use system setting
+									? verticalScrollValue					//then use custom value
+									: (-1 == systemScrollLines)				//otherwise, if system setting is scroll by page
+										? 3										//then default to 3
+										: systemScrollLines;						//otherwise use system setting
 				if (zDelta < 0)	vtD.lVal = abs(zDelta);				//scroll down
 				else vtU.lVal = zDelta;								//scroll up
 			}
 
+			//scroll by line/cell or by page depending on alt key
+			LPOLESTR pstrMethodName = alt ? L"LargeScroll" : L"SmallScroll";
+			
 			//send scroll command
 			HRESULT scrollResult = AutoWrap(DISPATCH_METHOD, NULL, IDAppWin, pstrMethodName, 4, vtL, vtR, vtU, vtD); //Left, Right, Up, Down (reverse order!)
 
@@ -577,9 +525,11 @@ CallCancel:
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-EXTERN_C void STDAPICALLTYPE SetScrollSheets(BOOL newSetting)
+EXTERN_C void STDAPICALLTYPE SendSettings(int vert, int horiz, bool shts)
 {
-	scrollSheets = newSetting;
+	verticalScrollValue = vert;
+	horizontalScrollValue = horiz;
+	scrollSheets = shts;
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
