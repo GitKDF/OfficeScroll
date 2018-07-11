@@ -14,6 +14,10 @@
 //used to get scroll routing setting
 #define SPI_GETMOUSEWHEELROUTING    0x201C
 #define SPI_GETWHEELSCROLLCHARS   0x006C
+#define MOUSEWHEEL_ROUTING_FOCUS 0
+#define MOUSEWHEEL_ROUTING_HYBRID 1
+#define MOUSEWHEEL_ROUTING_MOUSE_POS 2
+
 //only defined in WinUser.h for Windows Vista or higher, project defined for Win2000+ in stdafx.h
 #define WM_MOUSEHWHEEL                  0x020E
 
@@ -637,7 +641,7 @@ void GetPane(HWND msgHwnd, IDispatch* &iDisp, long x, long y)
 BOOL VerifyRelevantHwnd(const DWORD &scrollRouting, const POINT &pt, HWND &msgHwnd)
 {
 	HWND checkwin;				//Handle used to check what window we're over
-	if (2 != scrollRouting)		//if scroll routing is not to the window under the cursor...
+	if (MOUSEWHEEL_ROUTING_MOUSE_POS != scrollRouting)		//if scroll routing is not to the window under the cursor...
 		checkwin = WindowFromPoint(pt);	//...get the window under the cursor
 	else						//otherwise the window receiving the message is the same as the one under the cursor
 		checkwin = msgHwnd;
@@ -648,19 +652,33 @@ BOOL VerifyRelevantHwnd(const DWORD &scrollRouting, const POINT &pt, HWND &msgHw
 	if (!GetClassName(checkwin, className, 50))		//if we couldn't get the class name for some reason...
 		return FALSE;									//don't handle the message
 
-	//if we're not over the excel pane (EXCEL7), the excel edit-in-cell box (EXCEL6), or the Word pane (_WwG)
-	if ((0 != lstrcmpi(className, L"EXCEL7")) && (0 != lstrcmpi(className, L"EXCEL6")) && (0 != lstrcmpi(className, L"_WwG")))
-		if (GetAncestor(msgHwnd, GA_ROOT) == GetAncestor(checkwin, GA_ROOT)) 		//and we ARE over our own parent window
-			return FALSE;																//don't handle the message
-			//we don't care if we're not over the Excel/Word pane as long as we're over another window completely as can be the case with
-			//scroll to focus window, but if we're not over the Excel/Word pane and we are over our window, then we're over the ribbon
 
-	//if we are in Excel, check if the window receiving the message is the excel edit-in-place box
-	//and change msgHwnd (passed by reference) to the main Excel Pane
-	if (!g_AppID) {			//ignore all of this if g_AppID is 1 means we're in word
-		//if scroll is not to the window under the cursor, get the classname of the window receiving the message
+	if (g_AppID)
+	{		//if g_AppID is 1 means we're in Word
+		if (0 != lstrcmpi(className, L"_WwG"))		//if we're not over a Word pane (_WwG)
+				return FALSE;							//don't handle the message
+	}
+	else
+	{		//otherwise we're in Excel
+		//If scrollRouting is to the cursor and we're over an EXCEL; control (the box to the left of the formula bar),
+		//we just want to ditch these events all together since if we pass it on, excel will scroll the active window.
+		//We do this by returning false and setting msgHwnd to NULL, which we'll check for when calling this function.
+		//If scrollrouting is to focus, then passing it on is fine since an activeWindow scroll is expected behavior.
+		if ((MOUSEWHEEL_ROUTING_MOUSE_POS == scrollRouting) && (0 == lstrcmpi(className, L"EXCEL;"))) {
+			msgHwnd = NULL;
+			return FALSE;
+		}
+
+		//if we're not over the excel pane (EXCEL7), or the excel edit-in-cell box (EXCEL6)
+		if ((0 != lstrcmpi(className, L"EXCEL7")) && (0 != lstrcmpi(className, L"EXCEL6")))
+			return FALSE;				//don't handle the message
+
+		//the following is to check if the window receiving the message is the excel edit-in-place
+		//box and if so change msgHwnd (passed by reference) to the main Excel Pane
+
+		//if scroll is not to the window under the cursor, first we need to get the classname of the window receiving the message
 		//we only need to do this if scroll routing is focus or hybrid, since otherwise they're the same window, set a few lines above (checkwin = msgHwnd)
-		if (2 != scrollRouting)
+		if (MOUSEWHEEL_ROUTING_MOUSE_POS != scrollRouting)
 			if (!GetClassName(msgHwnd, className, 50))		//if we couldn't get the class name for some reason...
 				return FALSE;									//don't handle the message
 
@@ -728,12 +746,9 @@ LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wMsg, LPARAM lParam)
 		//	MOUSEWHEEL_ROUTING_MOUSE_POS = 2 to window under cursor (windows 8.1+)
 		DWORD scrollRouting;
 		if (!SystemParametersInfo(SPI_GETMOUSEWHEELROUTING, 0, &scrollRouting, 0))
-			scrollRouting = 0;
+			scrollRouting = MOUSEWHEEL_ROUTING_FOCUS;
 
 		POINT pt = ((LPMOUSEHOOKSTRUCTEX)lParam)->pt;
-
-		if (!VerifyRelevantHwnd(scrollRouting, pt, msgHwnd))
-			CallNext;
 
 		//get scroll distance; positive value is scroll up; divide by wheel_delta which is 120, since that is one "Click"
 		//mousewheels with no click for finite control will not react if scrolled too slowly, since this will get truncated to 0 during integer division
@@ -752,6 +767,13 @@ LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wMsg, LPARAM lParam)
 
 		//if we get here, we're over a word or excel window, and doing a scroll action other than ctrl+alt for a sheet change in excel
 
+		//call function to make sure that we're over a window where we want to handle scroll events
+		if (!VerifyRelevantHwnd(scrollRouting, pt, msgHwnd))
+			if (NULL == msgHwnd)		//if the function returned false, and set msgHwnd to NULL...
+				CallCancel;					//then we want to suppress this scroll message completely
+			else						//if it returned false without changing msgHwnd...
+				CallNext;					//then pass the message on
+
 		//use an actual IDispatch rather than a variant to get window under cursor (rather than active window as previous version)
 		//we don't need to worry about getting the active window if the system is set to scroll the focus window, as it will be the
 		//active window that receives the scroll message anyway, not the window under cursor
@@ -759,7 +781,7 @@ LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wMsg, LPARAM lParam)
 		if IS_OK(AccessibleObjectFromWindow(msgHwnd, OBJID_NATIVEOM, IID_IDispatch, (void **)&IDAppWin))  //get IDispatch to window under cursor
 		{
 			//if scrollrouting is to the window under the cursor, we're going to get the active pane of the window under the cursor
-			if (2 == scrollRouting)
+			if (MOUSEWHEEL_ROUTING_MOUSE_POS == scrollRouting)
 				GetPane(msgHwnd, IDAppWin, pt.x, pt.y);
 
 			VARIANT vtL, vtR, vtU, vtD;
