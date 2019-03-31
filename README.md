@@ -19,5 +19,5 @@ If Windows AppLocker is active on your system, depending on the configuration, y
 ## Install/Remove
 You can install this add-in as a standard user (non-administrator).<br/>
 1. Unzip all files.<br/>
-2. Double click INSTALL.bat to copy files to their folders (double click REMOVE.bat to delete all files).<br/>
+2. Move files to appropriate locations
 3. Restart Word and Excel.
